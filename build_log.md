@@ -6,155 +6,168 @@ interviewer asking "why did you do it that way?"
 
 ---
 
-## Session 1 — Foundation, Ingestion, Chunking, Embeddings
+# Session 1 — Phase 1 Complete: Working RAG Core
 
-**Goal:** a working RAG core — ask a HIPAA question in a script, get a grounded,
-cited answer.
+**Goal:** ask a HIPAA question in a script, get a grounded, cited answer — and a
+refusal when the documents don't cover it.
+
+**Status: achieved.**
+
+```
+Q: How long do I have to notify individuals after a breach?
+A: A covered entity must provide the notification "without unreasonable delay and
+   in no case later than 60 calendar days after discovery of a breach" (§ 164.404).
+
+Q: What is the best pizza topping?
+A: I don't know — the provided HIPAA documents don't cover this.
+   (closest match 0.902 exceeded threshold 0.75 — LLM never called)
+```
+
+---
+
+## What a RAG system is, and which parts exist here
+
+**Retrieval-Augmented Generation:** rather than relying on what a language model
+memorized during training, you retrieve relevant passages from your own documents
+and hand them to the model as context. The model's job becomes *reading and
+synthesizing*, not *recalling*. That is what makes citations possible and
+hallucination controllable.
+
+| Stage | Implementation | File |
+|---|---|---|
+| Ingest | PDF → text, artifact removal | `clean_text.py` |
+| Chunk | Section-aware splitting + citation metadata | `chunk.py` |
+| Embed | Local sentence-transformers → Chroma | `embed.py` |
+| Retrieve | Hybrid dense + BM25, reciprocal rank fusion | `search.py` |
+| Generate | Gemini, constrained to excerpts, cited | `ask.py` |
+| Refuse | Distance threshold gate before the API call | `ask.py` |
+
+The last two rows are what distinguish this from a tutorial RAG build.
 
 ---
 
 ## 1. Environment
 
-### Decision: build on `D:\ClauseWise` (secondary NTFS drive), not `C:` or OneDrive
+### Decision: build on `D:\ClauseWise` (secondary NTFS drive)
 
 | Option | Verdict | Reason |
 |---|---|---|
-| `C:\dev\clausewise` | Fallback | Only ~31 GB free; Docker's WSL2 disk alone can consume 20 GB+ by Phase 5 |
-| OneDrive folder | **Rejected** | Sync locks files mid-write → random `WinError 32` during `pip install`; Files On-Demand evicts packages → phantom `ModuleNotFoundError`; races with `.git` writes and can corrupt the repo. Cloud storage is not disk. |
+| `C:\dev\clausewise` | Fallback | Only ~31 GB free; Docker's WSL2 disk alone can reach 20 GB+ by Phase 5 |
+| OneDrive folder | **Rejected** | Sync locks files mid-write → `WinError 32` during pip installs; Files On-Demand evicts packages → phantom `ModuleNotFoundError`; races with `.git` writes. Cloud storage is not disk. |
 | `D:\ClauseWise` | **Chosen** | 860 GB free, NTFS, fixed disk |
 
-**Problem hit:** creating the folder via Explorer's admin prompt made it owned by
-`Administrators`, so the normal user account couldn't write inside it.
+**Problem:** creating the folder through Explorer's admin prompt left it owned by
+`Administrators`, so the normal account couldn't write inside it.
 
-**Fix:**
 ```powershell
 takeown /F "D:\ClauseWise" /R /D Y
 icacls "D:\ClauseWise" /grant "$($env:USERNAME):(OI)(CI)F" /T
 icacls "D:\ClauseWise" /inheritance:e
 ```
-`(OI)(CI)` propagates the grant to files and subfolders, so this is a one-time fix.
 
-**Verified NTFS before committing to the drive.** This mattered: Python venvs and
-Chroma's SQLite backing store are unreliable on exFAT/FAT32, which is the default
-on drives that get moved between machines. Checking `Get-Volume D` up front avoided
-a class of bug that would have looked like application errors much later.
+**Verified NTFS before committing to the drive.** Python venvs and Chroma's SQLite
+store are unreliable on exFAT/FAT32 — common on drives moved between machines.
+One `Get-Volume` check avoided a class of bug that would have surfaced much later
+looking like application errors.
 
-### Decision: virtual environment from day one
+### Dependencies and why each
 
-Not optional hygiene — a prerequisite. Without a venv, `requirements.txt` is a
-guess rather than a fact, and the Dockerfile in Phase 3 will build an image that
-doesn't match the local environment. The venv is what makes containerization
-reproducible.
-
-### Dependencies and why each one
-
-| Package | Role | Why this one |
+| Package | Role | Rationale |
 |---|---|---|
-| `google-genai` | LLM (answer generation) | Free tier, no credit card. **Note:** Google has moved to the Interactions API; the older `google-generativeai` SDK patterns no longer apply. |
-| `sentence-transformers` | Embeddings | Runs **locally on CPU** — no API cost, no rate limit, no network dependency. Deliberate: embedding happens on every query, so an API-based embedder would collide with free-tier quotas during Phase 6 load testing. |
-| `chromadb` | Vector store | Embedded, file-backed, zero infrastructure. A hosted vector DB (Pinecone/Weaviate) would add cost and a network hop for no benefit at this scale. |
-| `pypdf` | PDF text extraction | Pure Python, no system dependencies — matters for a slim Docker image later. |
-| `python-dotenv` | Secret loading | Keeps the API key out of source control. |
+| `google-genai` | Answer generation | Free tier, no card. **Note:** Google moved to the Interactions API; older `google-generativeai` patterns no longer apply. |
+| `sentence-transformers` | Embeddings | Runs **locally on CPU** — no cost, no rate limit. Deliberate: embedding runs on every query, so an API embedder would collide with free-tier quota during Phase 6 load testing. |
+| `chromadb` | Vector store | Embedded, file-backed, zero infrastructure. |
+| `rank-bm25` | Keyword retrieval | Added mid-session to fix a retrieval failure (see §5). |
+| `pypdf` | PDF extraction | Pure Python — matters for a slim Docker image. |
+| `python-dotenv` | Secrets | Keeps the API key out of source control. |
 
-**Cost of the `sentence-transformers` choice:** it pulls in PyTorch, ~2.5 GB.
-That will inflate the Docker image in Phase 3 and is a known optimization target
-(CPU-only torch wheel, multi-stage build).
+**Cost of the local-embedding choice:** PyTorch, ~2.5 GB. Known Phase 3
+optimization target (CPU-only wheel, multi-stage build).
 
 ---
 
 ## 2. Corpus
 
-**Source:** [HIPAA Administrative Simplification — Combined Regulation Text](https://www.hhs.gov/sites/default/files/hipaa-simplification-201303.pdf)
+**Source:** HIPAA Administrative Simplification Combined Regulation Text
 (45 CFR Parts 160, 162, 164). 115 pages, public domain.
 
-### Why this document specifically
+### Why this document
 
-Every provision carries a numbered section marker — `§ 164.312 Technical safeguards.`
-Those numbers become **citation targets that are structural facts, not model output**.
+Every provision carries a numbered marker — `§ 164.312 Technical safeguards.`
+Those numbers become **citation targets that are structural facts, not model output.**
 
-This is the central design decision of the whole project. A RAG system that answers
-"according to the documents…" is unverifiable. One that answers "per § 164.312(a)(1),
-Access Control…" can be checked against the source in ten seconds. For a compliance
-tool, that difference is the entire value proposition — and it's only possible
-because the citation is attached during ingestion, never generated by the LLM.
+This is the central design decision of the project. A RAG system answering
+"according to the documents…" is unverifiable. One answering "per § 164.404…" can
+be checked against the source in ten seconds. For a compliance tool that difference
+*is* the value — and it only works because citations are captured during ingestion
+and never generated by the LLM.
 
 ---
 
-## 3. Ingestion pipeline
+## 3. Ingestion
 
-Built as four separate scripts rather than one, so each stage is independently
-inspectable. Debugging a monolithic ingest script is miserable.
+Built as separate scripts per stage rather than one pipeline, so each is
+independently inspectable. Debugging a monolithic ingest script is miserable.
 
 ```
-data/*.pdf
-   → inspect_pdfs.py   (measure extraction quality — do not skip)
-   → clean_text.py     (strip artifacts, unwrap lines)
-   → chunk.py          (split on section boundaries, attach citations)
-   → embed.py          (vectorize, store in Chroma)
+data/*.pdf → inspect_pdfs.py → clean_text.py → chunk.py → embed.py → chroma_db/
 ```
 
-### Step 1: `inspect_pdfs.py` — measure before designing
+### Step 1 — `inspect_pdfs.py`: measure before designing
 
-**Principle: never design a chunking strategy before looking at the actual
-extracted text.** PDF extraction is lossy in document-specific ways, and assumptions
-made blind will be wrong.
+**Principle: never design a chunking strategy before reading the actual extracted
+text.** PDF extraction is lossy in document-specific ways; blind assumptions are wrong.
 
-Results:
-- 115 pages → **470,012 characters** (confirms real text layer, not a scanned image —
-  a scanned PDF would have shown near-zero characters and required OCR)
+- 115 pages → **470,012 characters** (confirms a real text layer; a scanned PDF
+  would have shown near-zero and required OCR)
 - **872 section markers** found
 
-Three defects visible in the raw sample:
-1. **Running footer injected mid-sentence** — `HIPAA Administrative Simplification
-   Regulation Text / March 2013 / 64` appears on all 115 pages, landing *inside*
-   sentences and splitting words (`elec tronic`)
-2. **Hard line wrapping** at ~30 characters (narrow two-column PDF layout)
-3. **Inflated marker count** — the first 8 pages are a table of contents listing
-   every section, so roughly half the markers were headings, not provisions
+Three defects visible immediately:
 
-### Step 2: `clean_text.py` — remove artifacts
+1. **Running footer injected mid-sentence** — appears on all 115 pages, splitting
+   words (`elec tronic`)
+2. **Hard line wrapping** at ~30 chars (narrow two-column layout)
+3. **Inflated marker count** — the first 8 pages are a table of contents
 
-- Drop lines matching the running header, standalone dates, standalone page numbers
-- Rejoin wrapped lines; repair hyphenated words split across line breaks
-- Detect and skip TOC pages via dot-leader density (`\.{5,}` appearing 5+ times)
-- Strip Federal Register amendment citations (`[68 FR 8376, Feb. 20, 2003]`) — these
-  are legislative history, pure noise for question-answering
+### Step 2 — `clean_text.py`: remove artifacts
 
-**Results:** 470,012 → **413,328 characters**. Footer leftovers: **0**.
+Drop header/date/page-number lines; rejoin wrapped lines; repair hyphenation;
+skip TOC pages via dot-leader density; strip Federal Register amendment citations
+(legislative history — pure noise for question answering).
+
+**Result:** 470,012 → **413,328 chars**. Footer leftovers: **0**.
 Word-split damage: `electronic` 115 vs `elec tronic` 1 — negligible.
 
-**Note the `elec tronic` counter is a deliberate quality probe, not decoration.**
+The `elec tronic` counter is a deliberate **quality probe**, not decoration.
 Page-break word splits can't be fully repaired automatically, so the pipeline
-*measures* the damage rather than assuming it away. Had that ratio been bad, the
-correct response was to change extraction strategy, not to proceed and hope.
+*measures* the damage. Had the ratio been bad, the correct response was to change
+extraction strategy, not proceed and hope.
 
-### Step 3: `chunk.py` — section-aware splitting
+---
 
-**Why not fixed-size chunking?** Splitting every N characters produces chunks that
+## 4. Chunking
+
+**Why not fixed-size chunks?** Splitting every N characters produces chunks that
 begin mid-sentence and straddle two unrelated provisions. The model then answers
-using half of § 164.308 and half of § 164.310 — fluent, authoritative, and wrong.
-In a compliance tool that is the failure mode that matters most.
+using half of § 164.308 and half of § 164.310 — fluent, authoritative, wrong. In a
+compliance tool that is the failure mode that matters most.
 
-**Strategy:** split on section boundaries. Each chunk carries `section`, `title`,
-and `part` as separate metadata fields. Sections exceeding 2,500 characters are
-sub-split on sentence boundaries with 250-character overlap, so context isn't
-severed at the seam.
+**Strategy:** split on section boundaries; carry `section`, `title`, `part` as
+metadata; sub-split oversized sections on sentence boundaries with overlap.
 
-#### Bug found: cross-references matched as section headers
+### Bug 1 — cross-references matched as section headers
 
-First run produced a chunk titled `§ 164.312 , § 164` — nonsense.
+First run produced a chunk titled `§ 164.312 , § 164`.
 
-**Cause:** the regex matched the phrase *"in accordance with § 164.312, § 164.314
-and § 164.316"* appearing inside the body of § 164.306. The pattern couldn't
+**Cause:** the regex matched *"in accordance with § 164.312, § 164.314 and
+§ 164.316"* appearing inside the body of § 164.306. The pattern couldn't
 distinguish a section being **defined** from one being **mentioned**.
 
-**Impact if shipped:** chunk boundaries landing mid-sentence, and text from
-§ 164.306 labeled as § 164.312 — **a confidently mislabeled citation**, the single
-worst outcome for this application.
+**Impact if shipped:** § 164.306's text labeled as § 164.312 — a confidently
+mislabeled citation.
 
-**Fix:** require the section number to be followed by a Title-Case title ending in
-a period, then a subsection marker `(a)` or a new sentence. A cross-reference is
-followed by a comma or lowercase text and fails the test.
+**Fix:** require a Title-Case title ending in a period, followed by a subsection
+marker `(a)` or a new sentence. Cross-references fail this test.
 
 ```python
 SECTION_RE = re.compile(
@@ -164,121 +177,241 @@ SECTION_RE = re.compile(
 )
 ```
 
-#### Automated validation
+Suspicious labels: **128 → 5.**
 
-Rather than eyeballing 266 chunks, the chunker asserts its own correctness:
+### Bug 2 — duplicate section IDs
 
-- every section-initial chunk must literally begin with its own section number
-- no title may contain a comma or a `§` (both indicate a cross-reference match)
-- sections split into unusually many pieces are flagged as possible missed boundaries
+Chroma rejected the insert: 13 duplicated IDs. Some section numbers matched twice —
+once in a subpart contents listing, once as the real provision.
 
-This caught the mislabeling immediately and cut suspicious labels from **128 → 5**.
+**Fix:** when a number matches more than once, keep the occurrence with the most
+body text (contents entries are short; provisions are long). Then `assert` ID
+uniqueness so this can never reach the vector store again.
 
-**Final output: 266 chunks, average 1,650 chars, all three Parts covered.**
+**Why assert rather than deduplicate silently:** silent data-quality failures are
+what make RAG systems mysteriously bad. Better to crash at build time than serve
+wrong citations at query time.
 
----
+### Chunking output
 
-## 4. Known limitations
+498 chunks · avg 953 chars · Parts 160, 162, 164 all covered · IDs unique
 
-Documented deliberately. An interviewer trusts a measured limitation far more than
-a claim of perfection.
-
-- **Page-spanning section headers are lost during extraction.** Where a header like
-  `§ 160.103 Definitions.` falls across a PDF page boundary, the header is destroyed
-  by the cleaning step. The body text survives but is attributed to the *preceding*
-  section. Confirmed by diagnostic: `§ 160.103` appears only 4 times in the cleaned
-  text, all as cross-references, never as a header.
-- **Scope:** affects ~5 of 266 chunks (~2%). Content is retrievable; only the
-  citation label is wrong on those.
-- **Root cause is in `clean_text.py`, not `chunk.py`** — collapsing the document to
-  a single string discards the line structure needed to reconstruct split headers.
-- **Future fix:** preserve line boundaries through cleaning, reassemble headers
-  before flattening.
-
-**Why this wasn't fixed now:** four iterations had already gone into the chunker,
-and the remaining defect is in an earlier stage. 98% citation accuracy with a
-documented, measured, root-caused limitation is a better use of a portfolio project's
-time than a perfect ingester and no deployment. Phases 2–8 carry more career signal.
+**Note on chunk size:** started at 2,500 chars, reduced to 1,200. Larger chunks
+average too much unrelated content into a single vector, diluting specific
+provisions. Halving the size measurably improved the breach-notification query
+(distance 0.393 → 0.321) and surfaced the exact answering sentence as the top hit.
 
 ---
 
-## 5. Embeddings
+## 5. Retrieval — the hardest part of the session
 
-### What an embedding actually is
+### What embeddings are
 
-A model reads a passage and outputs a fixed-length list of numbers — a *vector* —
-positioned in a high-dimensional space such that **passages with similar meaning
-land near each other**. "Encrypt patient records at rest" and "implement a mechanism
-to encrypt electronic protected health information" contain almost no shared
-keywords, but their vectors sit close together.
+A model converts a passage into a fixed-length vector positioned so that
+**passages with similar meaning land near each other.** "Notify people about a
+breach" and "provide notification following discovery of a breach of unsecured
+protected health information" share few words but sit close in vector space.
 
-That is why RAG beats keyword search here. Users ask questions in plain English;
-the regulation is written in dense legal prose. Vector similarity bridges the two.
+That's why RAG beats keyword search here: users ask in plain English, regulations
+are written in dense legal prose.
 
-### Decision: `all-MiniLM-L6-v2`, local
+**Model: `all-MiniLM-L6-v2`** — 384 dimensions, ~90 MB, CPU, free.
+Rejected: Gemini's embedding API (would burn free-tier quota on every query,
+colliding with Phase 6 load testing) and larger local models (3× slower, 5× bigger,
+unjustified for 498 chunks).
 
-| | |
+**Enrichment:** section number and title are prepended to the text *before*
+embedding, but the clean body is what's stored for the LLM to read. The heading is
+the densest semantic signal in a chunk; leaving it in metadata only discards it
+from the vector.
+
+**Metric:** cosine, set explicitly. Chroma defaults to squared L2. Sentence-transformer
+vectors are normalized, so cosine is correct — with L2 nothing errors, results are
+just quietly worse.
+
+### Measured retrieval quality *before* building generation
+
+This ordering mattered. Results across four probe queries:
+
+| Query | Result |
 |---|---|
-| Dimensions | 384 |
-| Size | ~90 MB |
-| Runs on | CPU, no GPU required |
-| Cost | $0, no network call |
+| Breach notification timing | **Excellent** — § 164.404, distance 0.321, exact answering sentence |
+| Business associate definition | **Good** — correct definition retrieved |
+| Off-topic control ("pizza") | **Excellent** — 0.90+, clean separation |
+| Encryption at rest | **Failed** — § 164.312 not in top 40 of 498 |
 
-**Rejected alternatives:**
-- **Gemini embedding API** — would consume free-tier quota on *every query*,
-  colliding directly with Phase 6 load testing (thousands of synthetic questions).
-- **Larger local models** (`all-mpnet-base-v2`, 768-dim) — better quality, roughly
-  3× slower and 5× larger. Not justified for 266 chunks, and it would worsen the
-  already-heavy container image.
+Had generation been built first, the encryption query would have produced a
+confident, well-cited, **wrong** answer — and the cause would have been invisible
+behind fluent prose.
 
-**Architectural consequence:** because embedding is local and free, it stays cheap
-under load. The only rate-limited component is answer *generation*, which is why
-that call is isolated behind a single swappable function — a stub can replace it
-during load tests without touching retrieval.
+### Bug 3 — substring collisions in keyword matching
 
-### Storage: Chroma, persisted to `chroma_db/`
+The first hybrid-search attempt scored chunks by counting query terms via a
+6-character prefix match. `rest` matched `interest`, `restriction`, `requested`;
+`data` matched almost everything. The keyword retriever promoted noise and rank
+fusion amplified it. **Results got worse, and a previously-working query regressed.**
 
-Git-ignored and rebuildable from `chunks.json` in seconds. Derived artifacts don't
-belong in source control — the recipe does, not the output.
+**Fix: BM25** (`rank-bm25`) — the standard sparse retrieval algorithm. It
+down-weights terms appearing in many documents (so `data` counts for almost nothing
+while `encrypt` counts heavily), normalizes for document length, and matches whole
+tokens rather than substrings. Restored the regressed query immediately.
+
+### Reciprocal Rank Fusion
+
+Dense and sparse retrievers produce scores on incompatible scales (cosine distance
+vs. BM25 score), so any weighted blend needs a magic constant requiring endless
+tuning. RRF uses only **rank position**:
+
+```
+score(doc) = Σ  1 / (k + rank_in_that_retriever)
+```
+
+A chunk both retrievers rank highly wins, regardless of scale. Six lines, standard
+practice, no tuning.
+
+### Bug 4 — vocabulary mismatch (unresolved, documented)
+
+§ 164.312 contains the literal answer to the encryption query:
+
+> "Encryption and decryption (Addressable). Implement a mechanism to encrypt and
+> decrypt electronic protected health information."
+
+The chunk is correctly extracted, correctly labeled, and present in the index —
+**and ranks below 40th of 498.**
+
+**Diagnosed, not guessed:** wrote `check_312.py` to confirm the chunk exists, verify
+its label, list every chunk containing "encrypt" (6 of 498), and locate the target's
+actual rank. Only then was the cause identifiable.
+
+**Root cause:** `all-MiniLM-L6-v2` is a general-purpose model. It does not encode
+that "patient data at rest" and "electronic protected health information" are the
+same concept — a domain-specific equivalence it never learned. Meanwhile § 164.514
+discusses patients and data constantly, winning on surface similarity while being
+about an entirely different topic.
+
+**Attempted, with honest results:**
+
+| Attempt | Outcome |
+|---|---|
+| Reduce chunk size 2500 → 1200 | No effect on this query (helped others) |
+| Prepend title/section to embedded text | No effect on this query (helped others) |
+| Hybrid BM25 + dense with RRF | Fixed a *different* regression; not this |
+
+**Deferred fix:** domain-adapted embedding model, or LLM-based query expansion
+(rewrite the user's question into statutory vocabulary before retrieval).
+
+**Why deferred:** four iterations spent; the remaining gap is a model-capability
+limit, not a bug. Phase 7 builds retrieval-quality monitoring — the correct place to
+measure this against real query distributions rather than four hand-picked
+questions. Mitigation for now: return top-8 chunks and let the LLM filter.
+
+---
+
+## 6. Generation and grounding
+
+```python
+PROMPT = """You are a HIPAA compliance assistant. Answer ONLY from the excerpts below.
+
+RULES:
+- Use no outside knowledge. If the excerpts do not answer the question, reply
+  exactly: "I don't know — the provided HIPAA documents don't cover this."
+- Cite the section number after each claim, like (§ 164.404).
+- Quote the regulation's own wording for requirements where possible.
+"""
+```
+
+### Two-layer anti-hallucination
+
+**Layer 1 — distance threshold gate, before the API call.** If the closest chunk
+exceeds 0.75 cosine distance, return the refusal without invoking the LLM at all.
+
+Two benefits: it cannot be talked out of refusing by clever phrasing, and an
+off-topic query **costs zero tokens** — a real cost-per-query argument for the README.
+
+**Layer 2 — prompt constraint.** Instructs refusal when excerpts are insufficient.
+
+Defense in depth, because prompt rules alone are not reliable. The threshold is
+deterministic; the prompt is probabilistic.
+
+**Threshold calibration:** taken from measured data, not guessed. On-topic queries
+scored 0.32–0.46; the off-topic control scored 0.90+. 0.75 sits in the gap. This is
+why an off-topic probe query existed in the test set from the very first retrieval run.
+
+---
+
+## 7. Known limitations
+
+Documented deliberately. A measured limitation earns more trust than a claim of
+perfection.
+
+### Page-spanning section headers are lost
+
+Where a header like `§ 160.103 Definitions.` falls across a PDF page boundary, it is
+destroyed during cleaning. The body text survives but is attributed to the
+**preceding** section.
+
+**Confirmed by diagnostic:** `§ 160.103` appears only 4 times in the cleaned text,
+all as cross-references, never as a header.
+
+**Demonstrated consequence:** the business-associate answer is correct in substance
+but cites `(§ 160.102)` when the text is actually § 160.103. The system faithfully
+cites what its metadata says — correct behavior on incorrect data. For a compliance
+tool, this is the limitation that matters most, which is why it's stated first.
+
+**Scope:** ~5 of 498 chunks. **Root cause is in `clean_text.py`, not `chunk.py`** —
+collapsing the document to a single string discards the line structure needed to
+reconstruct split headers. **Fix:** preserve line boundaries through cleaning and
+reassemble headers before flattening.
+
+### Retrieval gap on vocabulary-mismatched queries
+
+See Bug 4. Instrumented in Phase 7 rather than guessed at.
 
 ---
 
 ## Interview questions this session prepares for
 
-- *"Why did you chunk on section boundaries instead of fixed size?"*
-  → Fixed-size chunks straddle unrelated provisions; the model then blends two
-  regulations into one confident, wrong answer.
-- *"How do you know your citations are accurate?"*
-  → Citations come from document structure captured at ingestion, never generated
-  by the LLM. Validated programmatically — which is how the cross-reference
-  mislabeling bug was caught.
-- *"What's broken in your system?"*
-  → Page-spanning headers, ~2% of chunks, root-caused to the cleaning stage,
-  measured and documented rather than assumed away.
-- *"Why local embeddings instead of an API?"*
-  → Embedding runs on every query. An API embedder would collide with free-tier
-  rate limits under load; local inference keeps retrieval cost-free and makes the
-  autoscaling demonstration meaningful.
-- *"What would you do differently?"*
-  → Preserve line structure through cleaning. Flattening to a single string was
-  convenient and destroyed recoverable header information.
+**"Why chunk on section boundaries instead of fixed size?"**
+Fixed-size chunks straddle unrelated provisions; the model then blends two
+regulations into one confident, wrong answer. Section boundaries also make each
+chunk self-contained *and* attach a citation label for free.
+
+**"How do you know your citations are accurate?"**
+They come from document structure captured at ingestion, never generated by the
+LLM, and are validated programmatically — which is how the cross-reference
+mislabeling bug was caught before it shipped.
+
+**"Why hybrid retrieval?"**
+Legal text is dense with terms of art where exact matching beats semantics —
+"encryption" appears in 6 of 498 chunks. Dense retrieval handles paraphrase; BM25
+handles precise terminology. RRF merges them without requiring comparable scales.
+
+**"How do you prevent hallucination?"**
+Two layers: a deterministic distance gate that refuses before the LLM is called,
+plus a prompt constraint. The gate can't be argued out of refusing, and costs zero
+tokens on off-topic queries.
+
+**"What's broken in your system?"**
+Page-spanning headers (~1% of chunks, root-caused to the cleaning stage) and a
+vocabulary-mismatch retrieval gap (root-caused to embedding model capability, with
+three fixes attempted and honestly reported as ineffective).
+
+**"What would you do differently?"**
+Preserve line structure through cleaning — flattening to a single string was
+convenient and destroyed recoverable information. And reach for BM25 before writing
+a naive keyword matcher; the first version had substring collisions that made
+results actively worse.
 
 ---
 
 ## Next
 
-**Phase 1 remaining:** retrieval quality check → generation with grounding →
-"I don't know" behavior when the corpus doesn't cover a question.
+**Phase 2 — API + UI.** First task is structural: `ask.py` reloads the embedding
+model and rebuilds the BM25 index on every invocation (~4s per question). Fine for a
+script, fatal for a service.
 
-**Then Phase 2:** FastAPI wrapper, `POST /ask` → answer + citations.
-- **Retrieval gap on vocabulary-mismatched queries.** "Encrypt patient data at
-  rest" fails to retrieve § 164.312, which contains the answer. Root cause:
-  `all-MiniLM-L6-v2` does not encode the equivalence between colloquial phrasing
-  and the statutory term "electronic protected health information."
-  Diagnosed by confirming the target chunk exists, is correctly labeled, and
-  ranks below 40/498.
-  Attempted: smaller chunks (no effect), title-enriched embeddings (no effect),
-  hybrid BM25 + dense retrieval with reciprocal rank fusion (fixed a separate
-  query, not this one).
-  Deferred fix: domain-adapted embedding model or LLM query expansion.
-  Instrumented in Phase 7 rather than guessed at.
+Refactor into a `RagEngine` class holding model, collection, and BM25 index as state,
+loaded once at startup. `ask.py` (CLI) and `api.py` (FastAPI) then become thin
+wrappers over the same engine. That structure is what makes the Phase 3 test suite
+straightforward and Phase 6 autoscaling metrics meaningful — a 4-second cold start
+per request would render the Grafana dashboards nonsense.
