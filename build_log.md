@@ -4,14 +4,14 @@ A running record of *what* was built, *why* each choice was made, and *what it c
 Written for two audiences: future-me returning after a two-week gap, and an
 interviewer asking "why did you do it that way?"
 
+**Status: Phases 1 and 2 complete. Next: Phase 3 (Docker + CI/CD).**
+
 ---
 
-# Session 1 — Phase 1 Complete: Working RAG Core
+# Session 1 — Phase 1: Working RAG Core
 
 **Goal:** ask a HIPAA question in a script, get a grounded, cited answer — and a
 refusal when the documents don't cover it.
-
-**Status: achieved.**
 
 ```
 Q: How long do I have to notify individuals after a breach?
@@ -38,11 +38,13 @@ hallucination controllable.
 | Ingest | PDF → text, artifact removal | `clean_text.py` |
 | Chunk | Section-aware splitting + citation metadata | `chunk.py` |
 | Embed | Local sentence-transformers → Chroma | `embed.py` |
-| Retrieve | Hybrid dense + BM25, reciprocal rank fusion | `search.py` |
-| Generate | Gemini, constrained to excerpts, cited | `ask.py` |
-| Refuse | Distance threshold gate before the API call | `ask.py` |
+| Retrieve | Hybrid dense + BM25, reciprocal rank fusion | `rag.py` |
+| Generate | Gemini, constrained to excerpts, cited | `rag.py` |
+| Refuse | Distance threshold gate before the API call | `rag.py` |
+| Serve | FastAPI, loaded once at startup | `api.py` |
+| Display | Streamlit, with visible retrieval scores | `ui.py` |
 
-The last two rows are what distinguish this from a tutorial RAG build.
+The refusal and citation rows are what distinguish this from a tutorial RAG build.
 
 ---
 
@@ -80,6 +82,8 @@ looking like application errors.
 | `rank-bm25` | Keyword retrieval | Added mid-session to fix a retrieval failure (see §5). |
 | `pypdf` | PDF extraction | Pure Python — matters for a slim Docker image. |
 | `python-dotenv` | Secrets | Keeps the API key out of source control. |
+| `fastapi` / `uvicorn` | HTTP service | Phase 2. Everything downstream (Docker, K8s, HPA, Prometheus) wraps a *server*. |
+| `streamlit` / `requests` | Demo UI | Phase 2. Makes the Phase 6 demo video possible. |
 
 **Cost of the local-embedding choice:** PyTorch, ~2.5 GB. Known Phase 3
 optimization target (CPU-only wheel, multi-stage build).
@@ -203,7 +207,7 @@ provisions. Halving the size measurably improved the breach-notification query
 
 ---
 
-## 5. Retrieval — the hardest part of the session
+## 5. Retrieval — the hardest part of the project so far
 
 ### What embeddings are
 
@@ -314,7 +318,7 @@ PROMPT = """You are a HIPAA compliance assistant. Answer ONLY from the excerpts 
 
 RULES:
 - Use no outside knowledge. If the excerpts do not answer the question, reply
-  exactly: "I don't know — the provided HIPAA documents don't cover this."
+  exactly: "{refusal}"
 - Cite the section number after each claim, like (§ 164.404).
 - Quote the regulation's own wording for requirements where possible.
 """
@@ -337,9 +341,146 @@ deterministic; the prompt is probabilistic.
 scored 0.32–0.46; the off-topic control scored 0.90+. 0.75 sits in the gap. This is
 why an off-topic probe query existed in the test set from the very first retrieval run.
 
+**Both layers observed firing in production** — see Phase 2, §10.
+
 ---
 
-## 7. Known limitations
+# Session 2 — Phase 2: API + UI
+
+**Goal:** turn three cold-start scripts into a running service with a defined
+contract and a face.
+
+**Status: achieved.** FastAPI on :8000, Streamlit on :8501, independent processes.
+
+---
+
+## 7. Why Phase 2 exists at all
+
+Every phase after this wraps around an HTTP service:
+
+- Docker containerizes a **server**
+- Kubernetes schedules a **server**
+- The Horizontal Pod Autoscaler scales a **server** by request load
+- Prometheus scrapes a **server's** metrics endpoint
+
+Containerizing `ask.py` would have produced a container that runs once and exits —
+nothing to scale, nothing to monitor. The UI is separately necessary: the Phase 6
+deliverable is a demo video, and nobody watches a terminal.
+
+## 8. The `RagEngine` refactor
+
+**The problem, visible in the Phase 1 logs:** running three questions produced three
+separate model loads. `ask.py` reloaded the 90 MB embedding model and rebuilt the
+BM25 index over all 498 chunks on *every invocation* — roughly 4 seconds each.
+
+Tolerable in a script. Fatal in a server, and it would have made the Phase 6
+autoscaling demo meaningless: the Grafana dashboards would have been measuring
+model loading, not request handling.
+
+**The fix:** a `RagEngine` class holding the embedding model, Chroma collection, and
+BM25 index as instance state. `ask.py` (CLI) and `api.py` (HTTP) both became thin
+wrappers over the same engine. `ask.py` shrank to ~20 lines.
+
+This is also what makes the Phase 3 test suite straightforward — tests instantiate
+the engine directly rather than shelling out to a script.
+
+### The stub-LLM switch
+
+`RagEngine(use_stub_llm=True)`, or `CLAUSEWISE_STUB_LLM=1`, replaces the Gemini call
+with canned text while leaving retrieval fully intact.
+
+Two payoffs, both planned from day one:
+
+- **Phase 3 CI** — tests exercise retrieval end-to-end with no API key and no quota
+  consumption, so the pipeline works on a fresh clone
+- **Phase 6 load testing** — thousands of synthetic requests without hitting the
+  10–15 requests/minute free-tier ceiling
+
+This is why local embeddings were chosen in Phase 1: only *generation* is rate
+limited, so isolating it behind one swappable method makes the whole system
+load-testable.
+
+## 9. Bug 5 — relative paths break when the working directory changes
+
+`DB_DIR = "chroma_db"` resolved relative to wherever the process was launched. Running
+uvicorn from `src/` made Chroma look for `src/chroma_db` and fail with
+`Collection [hipaa] does not exist`.
+
+**Fix — anchor to the project root, computed from the source file's own location:**
+
+```python
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DB_DIR = str(PROJECT_ROOT / "chroma_db")
+```
+
+`__file__` doesn't change with the working directory. Docker sets its own `WORKDIR`
+and Kubernetes sets another; this makes both irrelevant. Caught here for five
+minutes of work rather than inside a container.
+
+## 10. The API
+
+**`POST /ask`** → answer, citations, `grounded`, `llm_called`, `closest_distance`.
+**`GET /health`** → status + chunk count. Phase 4 uses this as the Kubernetes
+readiness probe.
+
+**Startup via FastAPI's `lifespan` hook** — the engine loads once before the server
+accepts traffic. This is the mechanism that makes the refactor pay off, and it is
+visible in the logs: requests produce no model reloading.
+
+**Validation is declarative.** `question: str = Field(min_length=3, max_length=1000)`
+means FastAPI rejects empty and oversized input with a 422 *before* application code
+runs. Pydantic models also generate the interactive docs at `/docs` for free.
+
+**Error mapping** — Gemini rate limits become a clean 429 with a retry message
+rather than a 500 and a stack trace. A service returns structured errors and stays up.
+
+### Observed: both refusal layers fire in production
+
+A live query retrieved excerpts *within* the distance threshold (closest 0.533) but
+the model correctly declined to answer from them. This confirms the two layers catch
+genuinely different failure modes:
+
+- **Layer 1** (distance gate) — questions outside the corpus entirely
+- **Layer 2** (prompt constraint) — questions where related text exists but isn't
+  responsive
+
+The UI now distinguishes them, because for a compliance user "we found nothing
+relevant" and "we found related text that doesn't answer you" are different answers.
+
+## 11. Observed: RAG handles lookup, not aggregation
+
+The query *"what is this document about"* retrieved eight mediocre matches
+(0.53–0.67) and the model declined.
+
+**Root cause is architectural, not a defect.** Retrieval selects passages by
+similarity to the question. A question with no specific subject has nothing to match
+against, so it pulls semantically arbitrary chunks. The same applies to *"summarize
+the Privacy Rule"* or *"how many sections are there"* — these need the whole corpus
+at once, which a retrieval system by definition never sees.
+
+**Addressed by scoping guidance in the UI**, not by engineering around it. A
+hardcoded corpus-summary path would be a canned answer disguised as retrieval, and
+for a compliance tool, overstating capability is a liability.
+
+## 12. The UI
+
+Streamlit, talking to the API over HTTP. Deliberate choices:
+
+- **Retrieval distances are shown next to every source.** Most RAG demos hide this.
+  Exposing it makes grounding *auditable* — a reviewer sees not only what was cited
+  but how confident retrieval was. That is a compliance instinct, not a chatbot one.
+- **Sidebar health check** — the UI degrades gracefully when the API is down,
+  which is exactly the behavior needed in Phase 4 when the API pod restarts.
+- **Full citation text comes from the API; truncation is the client's decision.**
+  The `/ask` payload is ~8 KB, mostly excerpt text — worth remembering when measuring
+  latency under load in Phase 6.
+
+`API_URL` is a single constant at the top of `ui.py`. In Phase 4 it becomes a
+Kubernetes service DNS name; that is the only line that will need to change.
+
+---
+
+## 13. Known limitations
 
 Documented deliberately. A measured limitation earns more trust than a claim of
 perfection.
@@ -356,7 +497,7 @@ all as cross-references, never as a header.
 **Demonstrated consequence:** the business-associate answer is correct in substance
 but cites `(§ 160.102)` when the text is actually § 160.103. The system faithfully
 cites what its metadata says — correct behavior on incorrect data. For a compliance
-tool, this is the limitation that matters most, which is why it's stated first.
+tool this is the limitation that matters most, which is why it is stated first.
 
 **Scope:** ~5 of 498 chunks. **Root cause is in `clean_text.py`, not `chunk.py`** —
 collapsing the document to a single string discards the line structure needed to
@@ -367,9 +508,13 @@ reassemble headers before flattening.
 
 See Bug 4. Instrumented in Phase 7 rather than guessed at.
 
+### No aggregation or summarization
+
+See §11. Architectural, disclosed in the UI.
+
 ---
 
-## Interview questions this session prepares for
+## Interview questions this work prepares for
 
 **"Why chunk on section boundaries instead of fixed size?"**
 Fixed-size chunks straddle unrelated provisions; the model then blends two
@@ -388,13 +533,24 @@ handles precise terminology. RRF merges them without requiring comparable scales
 
 **"How do you prevent hallucination?"**
 Two layers: a deterministic distance gate that refuses before the LLM is called,
-plus a prompt constraint. The gate can't be argued out of refusing, and costs zero
-tokens on off-topic queries.
+plus a prompt constraint. The gate can't be argued out of refusing and costs zero
+tokens on off-topic queries. Both have been observed firing on different failure modes.
+
+**"Why did you refactor into a class?"**
+The scripts reloaded a 90 MB model on every invocation. A server must load once at
+startup — otherwise the autoscaling metrics in Phase 6 would measure model loading
+rather than request handling.
+
+**"How will you load test something with a rate-limited LLM?"**
+Generation sits behind one swappable method with a stub mode. Retrieval stays real;
+the API call is replaced. This was designed in Phase 1 when local embeddings were
+chosen specifically so that generation would be the only rate-limited component.
 
 **"What's broken in your system?"**
-Page-spanning headers (~1% of chunks, root-caused to the cleaning stage) and a
-vocabulary-mismatch retrieval gap (root-caused to embedding model capability, with
-three fixes attempted and honestly reported as ineffective).
+Page-spanning headers (~1% of chunks, root-caused to the cleaning stage), a
+vocabulary-mismatch retrieval gap (root-caused to embedding model capability, three
+fixes attempted and honestly reported as ineffective), and no aggregation support
+(architectural, disclosed in the UI).
 
 **"What would you do differently?"**
 Preserve line structure through cleaning — flattening to a single string was
@@ -404,14 +560,19 @@ results actively worse.
 
 ---
 
-## Next
+## Next — Phase 3: Containerize + CI/CD
 
-**Phase 2 — API + UI.** First task is structural: `ask.py` reloads the embedding
-model and rebuilds the BM25 index on every invocation (~4s per question). Fine for a
-script, fatal for a service.
+1. **Dockerfile.** The known challenge: PyTorch makes a naive image ~3 GB. Getting
+   that down (CPU-only torch wheel, multi-stage build, layer ordering so
+   dependencies cache separately from source) is a real DevOps exercise and a good
+   measurable number for the README.
+2. **pytest suite.** Uses `CLAUSEWISE_STUB_LLM=1` so tests run without an API key.
+   Coverage: citation-label integrity, the refusal gate at both layers, ID
+   uniqueness, API contract shape.
+3. **GitHub Actions.** On push → test → build → publish to GitHub Container Registry.
 
-Refactor into a `RagEngine` class holding model, collection, and BM25 index as state,
-loaded once at startup. `ask.py` (CLI) and `api.py` (FastAPI) then become thin
-wrappers over the same engine. That structure is what makes the Phase 3 test suite
-straightforward and Phase 6 autoscaling metrics meaningful — a 4-second cold start
-per request would render the Grafana dashboards nonsense.
+**Open question for Phase 3:** whether `chroma_db/` is baked into the image or built
+at container startup. Baking it in is faster to boot and immutable, but inflates the
+image and couples data to code. Building at startup keeps the image lean but adds
+~30 seconds to pod startup — which interacts badly with autoscaling in Phase 6.
+Decide deliberately, and record the reasoning here.
