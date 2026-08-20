@@ -8,3 +8,5 @@ fastapi
 uvicorn[standard]
 streamlit
 requests
+pytest 
+httpx
