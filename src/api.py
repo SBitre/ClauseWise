@@ -3,6 +3,8 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from prometheus_client import Counter, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
 from src.rag import RagEngine
@@ -30,6 +32,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Default instrumentation covers request count, latency, and status codes.
+# The metrics below add the domain-specific signals that actually indicate
+# whether the ANSWERS are good — infrastructure metrics can't tell you that.
+REFUSALS = Counter(
+    "clausewise_refusals_total",
+    "Refusals by which layer caught them",
+    ["layer"],                      # "distance_gate" or "model"
+)
+RETRIEVAL_DISTANCE = Histogram(
+    "clausewise_retrieval_distance",
+    "Closest chunk distance per query — the input-drift signal",
+    buckets=[0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.85, 1.0],
+)
+LLM_CALLS = Counter("clausewise_llm_calls_total", "Gemini calls actually made")
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=1000)
@@ -54,7 +73,7 @@ class AskResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    """Kubernetes uses this in Phase 4 to decide when a pod is ready."""
+    """Kubernetes uses this as the startup, readiness, and liveness probe."""
     if engine is None:
         raise HTTPException(status_code=503, detail="Engine not loaded")
     return {"status": "ok", "chunks": engine.chunk_count}
@@ -79,6 +98,18 @@ def ask(req: AskRequest):
                 detail="LLM rate limit reached. Please retry in a moment.",
             )
         raise HTTPException(status_code=502, detail=f"Generation failed: {msg}")
+
+    # Record domain metrics. The distance histogram is the Phase 7 drift signal:
+    # if its distribution shifts right over time, incoming questions are moving
+    # away from what the corpus covers.
+    if result.closest_distance is not None:
+        RETRIEVAL_DISTANCE.observe(result.closest_distance)
+    if result.llm_called:
+        LLM_CALLS.inc()
+    if result.answer.startswith("I don't know"):
+        REFUSALS.labels(
+            layer="distance_gate" if not result.grounded else "model"
+        ).inc()
 
     return AskResponse(
         question=result.question,

@@ -32,6 +32,9 @@ spec:
                   name: clausewise-secrets
                   key: GEMINI_API_KEY
 
+            - name: CLAUSEWISE_STUB_LLM
+              value: "1"
+
           # Resource requests are what the HPA reads in Phase 6 to compute
           # utilization. Without a CPU request, autoscaling has no baseline.
           resources:

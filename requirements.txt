@@ -10,3 +10,4 @@ streamlit
 requests
 pytest 
 httpx
+prometheus-fastapi-instrumentator

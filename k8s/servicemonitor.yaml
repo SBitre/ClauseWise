@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: clausewise-api
+  labels:
+    app: clausewise-api          # ServiceMonitor selects on this
+spec:
+  type: ClusterIP
+  selector:
+    app: clausewise-api
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: clausewise-api
+  labels:
+    release: monitoring          # kube-prometheus-stack requires this label
+spec:
+  selector:
+    matchLabels:
+      app: clausewise-api
+  endpoints:
+    - port: http                 # matches the named port above
+      path: /metrics
+      interval: 15s
