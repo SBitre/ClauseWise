@@ -63,7 +63,9 @@ HIPAA PDF (45 CFR 160, 162, 164)
 └─────────────────────────────────────────────────────┘
       │
       ▼
-  FastAPI  ◀── Streamlit UI
+  FastAPI (2 replicas on Kubernetes)  ◀── Streamlit UI
+      │
+      └──▶ /metrics ──▶ Prometheus
 ```
 
 ---
@@ -77,8 +79,10 @@ HIPAA PDF (45 CFR 160, 162, 164)
 | Sparse retrieval | BM25 (`rank-bm25`) | Legal text is dense with exact terms of art |
 | Generation | Gemini (`gemini-3.7-flash`) | Free tier; the only rate-limited component |
 | API | FastAPI + Uvicorn | Declarative validation, generated OpenAPI docs |
-| UI | Streamlit | Fast demo surface; shows retrieval scores |
+| UI | Streamlit | Shows retrieval scores, making grounding auditable |
 | Container | Docker, `python:3.12-slim` | 703 MB published image |
+| Orchestration | Kubernetes (kind, local) | 2 replicas, startup/readiness/liveness probes |
+| Monitoring | Prometheus + ServiceMonitor | Custom RAG-quality metrics alongside RED metrics |
 | CI/CD | GitHub Actions → GHCR | Tests gate the image publish |
 
 ---
@@ -109,8 +113,12 @@ don't answer the question. Both have been observed firing on different failure m
 
 **The LLM call is swappable.** `CLAUSEWISE_STUB_LLM=1` replaces generation with a
 stub while leaving retrieval fully intact. This is what lets CI run the complete
-retrieval path with no API key, and what will make load testing possible against a
+retrieval path with no API key, and what makes load testing possible against a
 rate-limited free tier.
+
+**The vector index is baked into the image, not built at startup.** The index is a
+deterministic build artifact, so baking it in gives an immutable image and fast pod
+startup — which matters when an autoscaler adds capacity during a traffic spike.
 
 ---
 
@@ -123,10 +131,22 @@ rate-limited free tier.
 | Test suite | 16 tests, no API key required |
 | Citation error rate | 1 chunk / 498 (0.2%) — see Limitations |
 | Off-topic refusal | Fires pre-LLM at distance > 0.75 |
+| Kubernetes | 2 replicas, self-healing verified under pod deletion |
+| Prometheus targets | 2/2 up, 15s scrape interval |
 
 **Image size note:** the default PyTorch wheel bundles CUDA runtime libraries that
 are dead weight in a CPU-only container. Installing from the CPU index
 (`--index-url https://download.pytorch.org/whl/cpu`) cut the image roughly 70%.
+
+### Custom metrics exposed
+
+Beyond standard request rate, latency, and error metrics:
+
+| Metric | What it tells you |
+|---|---|
+| `clausewise_refusals_total{layer}` | Which refusal layer is catching queries — infrastructure metrics can't tell you whether answers are good |
+| `clausewise_retrieval_distance` | Histogram of closest-chunk distance per query. A rightward shift over time means incoming questions are drifting away from what the corpus covers |
+| `clausewise_llm_calls_total` | LLM calls actually made, vs. total requests — the cost-per-query signal |
 
 ---
 
@@ -182,7 +202,7 @@ python src/embed.py              # build the vector index (~30s)
 uvicorn src.api:app --port 8000
 ```
 
-Interactive docs at http://127.0.0.1:8000/docs
+Interactive docs at http://127.0.0.1:8000/docs · metrics at `/metrics`
 
 **UI** (second terminal):
 
@@ -195,6 +215,33 @@ streamlit run src/ui.py
 ```bash
 docker build -t clausewise:dev .
 docker run --rm -p 8000:8000 --env-file .env clausewise:dev
+```
+
+**Kubernetes** (local, via [kind](https://kind.sigs.k8s.io/)):
+
+```bash
+kind create cluster --name clausewise
+kind load docker-image clausewise:dev --name clausewise
+
+kubectl create secret generic clausewise-secrets \
+  --from-literal=GEMINI_API_KEY=your_key_here
+
+kubectl apply -f k8s/
+kubectl port-forward service/clausewise-api 8000:8000
+```
+
+Secrets are injected via `secretKeyRef` — the manifests contain a reference, never a
+value, and are safe to commit.
+
+**Monitoring:**
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace
+
+kubectl apply -f k8s/servicemonitor.yaml
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090
 ```
 
 **Tests** (no API key needed):
@@ -210,7 +257,7 @@ CLAUSEWISE_STUB_LLM=1 pytest -v
 ```
 src/
   rag.py            RagEngine — retrieval, generation, grounding gate
-  api.py            FastAPI service
+  api.py            FastAPI service + Prometheus instrumentation
   ui.py             Streamlit interface
   ask.py            CLI wrapper
   clean_text.py     PDF → cleaned text
@@ -218,6 +265,10 @@ src/
   embed.py          Vectorization → Chroma
   inspect_pdfs.py   Extraction quality measurement
   check_labels.py   Citation integrity diagnostic
+k8s/
+  deployment.yaml   2 replicas, probes, resource requests, secret injection
+  service.yaml      ClusterIP
+  servicemonitor.yaml  Prometheus scrape config
 tests/              16 tests, stub-LLM mode
 .github/workflows/  CI: test → build → publish to GHCR
 BUILD_LOG.md        Decision record and debugging history
@@ -232,11 +283,11 @@ BUILD_LOG.md        Decision record and debugging history
 | 1 — RAG core | Complete |
 | 2 — API + UI | Complete |
 | 3 — Docker + CI/CD | Complete |
-| 4 — Kubernetes | Next |
-| 5 — Prometheus + Grafana | Planned |
-| 6 — Autoscaling under load | Planned |
-| 7 — Quality + drift monitoring | Planned |
+| 4 — Kubernetes | Complete |
+| 5 — Prometheus instrumentation | Complete (Grafana dashboards in progress) |
+| 6 — Autoscaling under load | In progress |
+| 7 — Drift monitoring | Planned |
 | 8 — GitOps + cloud deploy | Optional |
 
-`BUILD_LOG.md` documents every design decision, the five bugs found during
+`BUILD_LOG.md` documents every design decision, the six bugs found during
 development, and how each was diagnosed.
