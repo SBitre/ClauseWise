@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clausewise-api
+  labels:
+    app: clausewise-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: clausewise-api
+  template:
+    metadata:
+      labels:
+        app: clausewise-api
+    spec:
+      containers:
+        - name: api
+          image: clausewise:dev
+          # Required: without this Kubernetes tries to pull from Docker Hub
+          # and fails, because the image only exists inside the kind node.
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 8000
+              name: http
+
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: clausewise-secrets
+                  key: GEMINI_API_KEY
+
+          # Resource requests are what the HPA reads in Phase 6 to compute
+          # utilization. Without a CPU request, autoscaling has no baseline.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+
+          # Startup: gives the engine time to load before other probes begin.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 5
+
+          # Readiness: gates traffic. A pod failing this is removed from the
+          # Service's endpoints but not restarted.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+
+          # Liveness: a pod failing this gets restarted.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 20
